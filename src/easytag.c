@@ -361,13 +361,125 @@ Save_List_Of_Files (GList *etfilelist, gboolean force_saving_files)
     return TRUE;
 }
 
+/*
+ * save_file_do_rename:
+ * @ETFile: the file being saved
+ * @filename_cur_utf8: current path, UTF-8 (for messages only)
+ * @filename_new_utf8: requested destination path, UTF-8 (for messages only)
+ *
+ * Performs the rename, handles conflicts/errors, and updates the ETFile
+ * File_Name state on success. Owns nothing of the caller's.
+ *
+ * Interactive conflict resolution is only enabled when rename confirmations
+ * are shown (SF_HideMsgbox_Rename_File == FALSE). In batch mode an existing
+ * destination is a normal, skippable error.
+ *
+ * Returns:  1  on success
+ *           0  on error, but the batch should continue (batch mode)
+ *          -1  when the batch must stop (error shown to the user, or the
+ *              user cancelled the conflict dialog)
+ */
+static gint
+save_file_do_rename (ET_File     *ETFile,
+                     const gchar *filename_cur_utf8,
+                     const gchar *filename_new_utf8)
+{
+    gboolean rc;
+    GError *error = NULL;
+    gchar *actual_path = NULL;
+    GtkWindow *parent;
+    const gchar *cur_filename =
+        ((File_Name *)ETFile->FileNameCur->data)->value;
+    const gchar *new_filename =
+        ((File_Name *)ETFile->FileNameNew->data)->value;
 
+    /* No UI at all (including the conflict dialog) when "Repeat action for
+     * the remaining files" is active. */
+    parent = SF_HideMsgbox_Rename_File ? NULL : GTK_WINDOW (MainWindow);
+
+    rc = et_rename_file (cur_filename, new_filename, &actual_path,
+                         parent, &error);
+
+    if (!rc)
+    {
+        gboolean user_cancelled =
+            g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED);
+        const gchar *errmsg =
+            (error != NULL) ? error->message : _("Unknown error");
+
+        if (user_cancelled)
+        {
+            /* A deliberate cancel is not an error: no dialog, no error
+             * log entry — but it stops the batch, like every other Cancel
+             * in Save_File(). */
+            et_application_window_status_bar_message (
+                ET_APPLICATION_WINDOW (MainWindow),
+                _("Rename cancelled"), TRUE);
+            g_clear_error (&error);
+            return -1;
+        }
+
+        if (!SF_HideMsgbox_Rename_File)
+        {
+            GtkWidget *errdialog;
+
+            errdialog = gtk_message_dialog_new (
+                GTK_WINDOW (MainWindow),
+                GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+                GTK_MESSAGE_ERROR, GTK_BUTTONS_CLOSE,
+                _("Cannot rename file '%s' to '%s'"),
+                filename_cur_utf8, filename_new_utf8);
+            gtk_message_dialog_format_secondary_text (
+                GTK_MESSAGE_DIALOG (errdialog), "%s", errmsg);
+            gtk_window_set_title (GTK_WINDOW (errdialog),
+                                  _("Rename File Error"));
+            gtk_dialog_run (GTK_DIALOG (errdialog));
+            gtk_widget_destroy (errdialog);
+        }
+
+        Log_Print (LOG_ERROR,
+                   _("Cannot rename file '%s' to '%s': %s"),
+                   filename_cur_utf8, filename_new_utf8, errmsg);
+
+        et_application_window_status_bar_message (
+            ET_APPLICATION_WINDOW (MainWindow),
+            _("File(s) not renamed"), TRUE);
+
+        g_clear_error (&error);
+
+        /* Batch mode: skip this file and keep saving the rest.
+         * Interactive mode: the user saw the error; stop. */
+        return SF_HideMsgbox_Rename_File ? 0 : -1;
+    }
+
+    /* Success: record the ACTUAL destination used. This is critical —
+     * without it the browser list shows the stale original destination
+     * after auto-rename or manual conflict resolution. */
+    {
+        File_Name *fn_new = (File_Name *)ETFile->FileNameNew->data;
+
+        /* Paranoia: et_rename_file() guarantees non-NULL on success when
+         * requested; don't crash if that ever changes. */
+        if (actual_path == NULL)
+            actual_path = g_strdup (fn_new->value);
+
+        g_free (fn_new->value);
+        fn_new->value = g_strdup (actual_path);
+
+        g_free (fn_new->value_utf8);
+        fn_new->value_utf8 = g_filename_display_name (actual_path);
+    }
+
+    ETFile->FileNameCur = ETFile->FileNameNew;
+    ET_Mark_File_Name_As_Saved (ETFile);
+
+    g_free (actual_path);
+    return 1;
+}
 
 /*
  * Save changes of the ETFile (write tag and rename file)
- *  - multiple_files = TRUE  : when saving files, a msgbox appears with ability
- *                             to do the same action for all files.
- *  - multiple_files = FALSE : appears only a msgbox to ask confirmation.
+ * Returns: 1 = done, -1 = stop the batch
  */
 static gint
 Save_File (ET_File *ETFile, gboolean multiple_files,
@@ -376,65 +488,25 @@ Save_File (ET_File *ETFile, gboolean multiple_files,
     const File_Tag *FileTag;
     const File_Name *FileNameNew;
     gint stop_loop = 0;
-    const gchar *filename_cur_utf8 = ((File_Name *)ETFile->FileNameCur->data)->value_utf8;
-    const gchar *filename_new_utf8 = ((File_Name *)ETFile->FileNameNew->data)->value_utf8;
+    const gchar *filename_cur_utf8 =
+        ((File_Name *)ETFile->FileNameCur->data)->value_utf8;
+    const gchar *filename_new_utf8 =
+        ((File_Name *)ETFile->FileNameNew->data)->value_utf8;
     gchar *basename_cur_utf8, *basename_new_utf8;
     gchar *dirname_cur_utf8, *dirname_new_utf8;
 
     g_return_val_if_fail (ETFile != NULL, 0);
 
-    basename_cur_utf8 = g_path_get_basename(filename_cur_utf8);
-    basename_new_utf8 = g_path_get_basename(filename_new_utf8);
+    basename_cur_utf8 = g_path_get_basename (filename_cur_utf8);
+    basename_new_utf8 = g_path_get_basename (filename_new_utf8);
 
-    /* Save the current displayed data */
-    //ET_Save_File_Data_From_UI((ET_File *)ETFileList->data); // Not needed, because it was done before
     FileTag     = ETFile->FileTag->data;
     FileNameNew = ETFile->FileNameNew->data;
 
     /*
-     * Check if file was changed by an external program
-     */
-    /*stat(filename_cur,&statbuf);
-    if (ETFile->FileModificationTime != statbuf.st_mtime)
-    {
-        // File was changed
-        GtkWidget *msgbox = NULL;
-        gint response;
-
-        msg = g_strdup_printf(_("The file '%s' was changed by an external program.\nDo you want to continue?"),basename_cur_utf8);
-        msgbox = msg_box_new(_("Write File"),
-                             GTK_WINDOW(MainWindow),
-                             NULL,
-                             GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
-                             msg,
-                             GTK_STOCK_DIALOG_WARNING,
-                             GTK_STOCK_NO,  GTK_RESPONSE_NO,
-                             GTK_STOCK_YES, GTK_RESPONSE_YES,
-                             NULL);
-        g_free(msg);
-
-        response = gtk_dialog_run(GTK_DIALOG(msgbox));
-        gtk_widget_destroy(msgbox);
-
-        switch (response)
-        {
-            case GTK_RESPONSE_YES:
-                break;
-            case GTK_RESPONSE_NO:
-            case GTK_RESPONSE_NONE:
-                stop_loop = -1;
-                return stop_loop;
-                break;
-        }
-    }*/
-
-
-    /*
      * First part: write tag information (artist, title,...)
      */
-    // Note : the option 'force_saving_files' is only used to save tags
-    if ( force_saving_files
-    || FileTag->saved == FALSE ) // This tag had been already saved ?
+    if (force_saving_files || FileTag->saved == FALSE)
     {
         GtkWidget *msgdialog = NULL;
         GtkWidget *msgdialog_check_button = NULL;
@@ -443,43 +515,55 @@ Save_File (ET_File *ETFile, gboolean multiple_files,
         if (g_settings_get_boolean (MainSettings, "confirm-write-tags")
             && !SF_HideMsgbox_Write_Tag)
         {
-            // ET_Display_File_Data_To_UI(ETFile);
+            msgdialog = gtk_message_dialog_new (
+                GTK_WINDOW (MainWindow),
+                GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+                GTK_MESSAGE_QUESTION, GTK_BUTTONS_NONE,
+                _("Do you want to write the tag of file '%s'?"),
+                basename_cur_utf8);
+            gtk_window_set_title (GTK_WINDOW (msgdialog),
+                                  _("Confirm Tag Writing"));
 
-            msgdialog = gtk_message_dialog_new(GTK_WINDOW(MainWindow),
-                                               GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
-                                               GTK_MESSAGE_QUESTION,
-                                               GTK_BUTTONS_NONE,
-                                               _("Do you want to write the tag of file ‘%s’?"),
-                                               basename_cur_utf8);
-            gtk_window_set_title(GTK_WINDOW(msgdialog),_("Confirm Tag Writing"));
             if (multiple_files)
             {
-                GtkWidget *message_area;
-                message_area = gtk_message_dialog_get_message_area(GTK_MESSAGE_DIALOG(msgdialog));
-                msgdialog_check_button = gtk_check_button_new_with_label(_("Repeat action for the remaining files"));
-                gtk_container_add(GTK_CONTAINER(message_area),msgdialog_check_button);
+                GtkWidget *message_area =
+                    gtk_message_dialog_get_message_area (
+                        GTK_MESSAGE_DIALOG (msgdialog));
+                msgdialog_check_button = gtk_check_button_new_with_label (
+                    _("Repeat action for the remaining files"));
+                gtk_container_add (GTK_CONTAINER (message_area),
+                                   msgdialog_check_button);
                 gtk_widget_show (msgdialog_check_button);
                 gtk_dialog_add_buttons (GTK_DIALOG (msgdialog),
-                                        _("_Discard"), GTK_RESPONSE_NO,
-                                        _("_Cancel"), GTK_RESPONSE_CANCEL,
-                                        _("_Save"), GTK_RESPONSE_YES, NULL);
-                gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(msgdialog_check_button), TRUE); // Checked by default
+                    _("_Discard"), GTK_RESPONSE_NO,
+                    _("_Cancel"),  GTK_RESPONSE_CANCEL,
+                    _("_Save"),    GTK_RESPONSE_YES, NULL);
+                gtk_toggle_button_set_active (
+                    GTK_TOGGLE_BUTTON (msgdialog_check_button), TRUE);
             }
             else
             {
                 gtk_dialog_add_buttons (GTK_DIALOG (msgdialog),
-                                        _("_Cancel"), GTK_RESPONSE_NO,
-                                        _("_Save"), GTK_RESPONSE_YES, NULL);
+                    _("_Cancel"), GTK_RESPONSE_NO,
+                    _("_Save"),   GTK_RESPONSE_YES, NULL);
             }
 
             gtk_dialog_set_default_response (GTK_DIALOG (msgdialog),
                                              GTK_RESPONSE_YES);
-            SF_ButtonPressed_Write_Tag = response = gtk_dialog_run(GTK_DIALOG(msgdialog));
-            // When check button in msgbox was activated : do not display the message again
-            if (msgdialog_check_button && gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(msgdialog_check_button)))
-                SF_HideMsgbox_Write_Tag = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(msgdialog_check_button));
-            gtk_widget_destroy(msgdialog);
-        }else
+            SF_ButtonPressed_Write_Tag = response =
+                gtk_dialog_run (GTK_DIALOG (msgdialog));
+
+            if (msgdialog_check_button
+                && gtk_toggle_button_get_active (
+                       GTK_TOGGLE_BUTTON (msgdialog_check_button)))
+            {
+                SF_HideMsgbox_Write_Tag =
+                    gtk_toggle_button_get_active (
+                        GTK_TOGGLE_BUTTON (msgdialog_check_button));
+            }
+            gtk_widget_destroy (msgdialog);
+        }
+        else
         {
             if (SF_HideMsgbox_Write_Tag)
                 response = SF_ButtonPressed_Write_Tag;
@@ -491,18 +575,15 @@ Save_File (ET_File *ETFile, gboolean multiple_files,
         {
             case GTK_RESPONSE_YES:
             {
-                gboolean rc;
-
-                // if 'SF_HideMsgbox_Write_Tag is TRUE', then errors are displayed only in log
-                rc = Write_File_Tag(ETFile,SF_HideMsgbox_Write_Tag);
-                // if an error occurs when 'SF_HideMsgbox_Write_Tag is TRUE', we don't stop saving...
+                /* Tag writing only — NO rename call here.
+                 * Rename is handled exclusively in the second part below. */
+                gboolean rc = Write_File_Tag (ETFile,
+                                              SF_HideMsgbox_Write_Tag);
                 if (rc != TRUE && !SF_HideMsgbox_Write_Tag)
                 {
                     stop_loop = -1;
-
                     g_free (basename_cur_utf8);
                     g_free (basename_new_utf8);
-
                     return stop_loop;
                 }
                 break;
@@ -512,24 +593,19 @@ Save_File (ET_File *ETFile, gboolean multiple_files,
             case GTK_RESPONSE_CANCEL:
             case GTK_RESPONSE_DELETE_EVENT:
                 stop_loop = -1;
-
                 g_free (basename_cur_utf8);
                 g_free (basename_new_utf8);
-
                 return stop_loop;
-                break;
             default:
                 g_assert_not_reached ();
                 break;
         }
     }
 
-
     /*
      * Second part: rename the file
      */
-    // Do only if changed! (don't take force_saving_files into account)
-    if ( FileNameNew->saved == FALSE ) // This filename had been already saved ?
+    if (FileNameNew->saved == FALSE)
     {
         GtkWidget *msgdialog = NULL;
         GtkWidget *msgdialog_check_button = NULL;
@@ -541,79 +617,100 @@ Save_File (ET_File *ETFile, gboolean multiple_files,
             gchar *msgdialog_title = NULL;
             gchar *msg = NULL;
             gchar *msg1 = NULL;
-            // ET_Display_File_Data_To_UI(ETFile);
 
-            dirname_cur_utf8 = g_path_get_dirname(filename_cur_utf8);
-            dirname_new_utf8 = g_path_get_dirname(filename_new_utf8);
+            dirname_cur_utf8 = g_path_get_dirname (filename_cur_utf8);
+            dirname_new_utf8 = g_path_get_dirname (filename_new_utf8);
 
-            // Directories were renamed? or only filename?
-            if (g_utf8_collate(dirname_cur_utf8,dirname_new_utf8) != 0)
+            if (g_utf8_collate (dirname_cur_utf8, dirname_new_utf8) != 0)
             {
-                if (g_utf8_collate(basename_cur_utf8,basename_new_utf8) != 0)
+                if (g_utf8_collate (basename_cur_utf8,
+                                    basename_new_utf8) != 0)
                 {
-                    // Directories and filename changed
-                    msgdialog_title = g_strdup (_("Rename File and Directory"));
-                    msg = g_strdup(_("File and directory rename confirmation required"));
-                    msg1 = g_strdup_printf (_("Do you want to rename the file and directory ‘%s’ to ‘%s’?"),
-                                           filename_cur_utf8, filename_new_utf8);
-                }else
-                {
-                    // Only directories changed
-                    msgdialog_title = g_strdup (_("Rename Directory"));
-                    msg = g_strdup(_("Directory rename confirmation required"));
-                    msg1 = g_strdup_printf (_("Do you want to rename the directory ‘%s’ to ‘%s’?"),
-                                            dirname_cur_utf8,
-                                            dirname_new_utf8);
+                    msgdialog_title =
+                        g_strdup (_("Rename File and Directory"));
+                    msg = g_strdup (
+                        _("File and directory rename confirmation required"));
+                    msg1 = g_strdup_printf (
+                        _("Do you want to rename the file and directory "
+                          "'%s' to '%s'?"),
+                        filename_cur_utf8, filename_new_utf8);
                 }
-            }else
-            {
-                // Only filename changed
-                msgdialog_title = g_strdup (_("Rename File"));
-                msg = g_strdup(_("File rename confirmation required"));
-                msg1 = g_strdup_printf (_("Do you want to rename the file ‘%s’ to ‘%s’?"),
-                                       basename_cur_utf8, basename_new_utf8);
-            }
-
-            g_free(dirname_cur_utf8);
-            g_free(dirname_new_utf8);
-
-            msgdialog = gtk_message_dialog_new(GTK_WINDOW(MainWindow),
-                                               GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
-                                               GTK_MESSAGE_QUESTION,
-                                               GTK_BUTTONS_NONE,
-                                               "%s",
-                                               msg);
-            gtk_message_dialog_format_secondary_text(GTK_MESSAGE_DIALOG(msgdialog),"%s",msg1);
-            gtk_window_set_title(GTK_WINDOW(msgdialog),msgdialog_title);
-            if (multiple_files)
-            {
-                GtkWidget *message_area;
-                message_area = gtk_message_dialog_get_message_area(GTK_MESSAGE_DIALOG(msgdialog));
-                msgdialog_check_button = gtk_check_button_new_with_label(_("Repeat action for the remaining files"));
-                gtk_container_add(GTK_CONTAINER(message_area),msgdialog_check_button);
-                gtk_widget_show (msgdialog_check_button);
-                gtk_dialog_add_buttons (GTK_DIALOG (msgdialog), _("_Discard"),
-                                        GTK_RESPONSE_NO, _("_Cancel"),
-                                        GTK_RESPONSE_CANCEL, _("_Save"),
-                                        GTK_RESPONSE_YES, NULL);
-                gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(msgdialog_check_button), TRUE); // Checked by default
+                else
+                {
+                    msgdialog_title = g_strdup (_("Rename Directory"));
+                    msg = g_strdup (
+                        _("Directory rename confirmation required"));
+                    msg1 = g_strdup_printf (
+                        _("Do you want to rename the directory "
+                          "'%s' to '%s'?"),
+                        dirname_cur_utf8, dirname_new_utf8);
+                }
             }
             else
             {
-                gtk_dialog_add_buttons (GTK_DIALOG (msgdialog), _("_Discard"),
-                                        GTK_RESPONSE_NO, _("_Save"),
-                                        GTK_RESPONSE_YES, NULL);
+                msgdialog_title = g_strdup (_("Rename File"));
+                msg = g_strdup (_("File rename confirmation required"));
+                msg1 = g_strdup_printf (
+                    _("Do you want to rename the file '%s' to '%s'?"),
+                    basename_cur_utf8, basename_new_utf8);
             }
-            g_free(msg);
-            g_free(msg1);
-            g_free(msgdialog_title);
+
+            g_free (dirname_cur_utf8);
+            g_free (dirname_new_utf8);
+
+            msgdialog = gtk_message_dialog_new (
+                GTK_WINDOW (MainWindow),
+                GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+                GTK_MESSAGE_QUESTION, GTK_BUTTONS_NONE,
+                "%s", msg);
+            gtk_message_dialog_format_secondary_text (
+                GTK_MESSAGE_DIALOG (msgdialog), "%s", msg1);
+            gtk_window_set_title (GTK_WINDOW (msgdialog), msgdialog_title);
+
+            if (multiple_files)
+            {
+                GtkWidget *message_area =
+                    gtk_message_dialog_get_message_area (
+                        GTK_MESSAGE_DIALOG (msgdialog));
+                msgdialog_check_button = gtk_check_button_new_with_label (
+                    _("Repeat action for the remaining files"));
+                gtk_container_add (GTK_CONTAINER (message_area),
+                                   msgdialog_check_button);
+                gtk_widget_show (msgdialog_check_button);
+                gtk_dialog_add_buttons (GTK_DIALOG (msgdialog),
+                    _("_Discard"), GTK_RESPONSE_NO,
+                    _("_Cancel"),  GTK_RESPONSE_CANCEL,
+                    _("_Save"),    GTK_RESPONSE_YES, NULL);
+                gtk_toggle_button_set_active (
+                    GTK_TOGGLE_BUTTON (msgdialog_check_button), TRUE);
+            }
+            else
+            {
+                gtk_dialog_add_buttons (GTK_DIALOG (msgdialog),
+                    _("_Discard"), GTK_RESPONSE_NO,
+                    _("_Save"),    GTK_RESPONSE_YES, NULL);
+            }
+
+            g_free (msg);
+            g_free (msg1);
+            g_free (msgdialog_title);
+
             gtk_dialog_set_default_response (GTK_DIALOG (msgdialog),
                                              GTK_RESPONSE_YES);
-            SF_ButtonPressed_Rename_File = response = gtk_dialog_run(GTK_DIALOG(msgdialog));
-            if (msgdialog_check_button && gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(msgdialog_check_button)))
-                SF_HideMsgbox_Rename_File = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(msgdialog_check_button));
-            gtk_widget_destroy(msgdialog);
-        }else
+            SF_ButtonPressed_Rename_File = response =
+                gtk_dialog_run (GTK_DIALOG (msgdialog));
+
+            if (msgdialog_check_button
+                && gtk_toggle_button_get_active (
+                       GTK_TOGGLE_BUTTON (msgdialog_check_button)))
+            {
+                SF_HideMsgbox_Rename_File =
+                    gtk_toggle_button_get_active (
+                        GTK_TOGGLE_BUTTON (msgdialog_check_button));
+            }
+            gtk_widget_destroy (msgdialog);
+        }
+        else
         {
             if (SF_HideMsgbox_Rename_File)
                 response = SF_ButtonPressed_Rename_File;
@@ -621,63 +718,29 @@ Save_File (ET_File *ETFile, gboolean multiple_files,
                 response = GTK_RESPONSE_YES;
         }
 
-        switch(response)
+        switch (response)
         {
             case GTK_RESPONSE_YES:
             {
-                gboolean rc;
-                GError *error = NULL;
-                const gchar *cur_filename = ((File_Name *)ETFile->FileNameCur->data)->value;
-                const gchar *new_filename = ((File_Name *)ETFile->FileNameNew->data)->value;
-                rc = et_rename_file (cur_filename, new_filename, &error);
+                /* Basenames stay owned by THIS function; the helper never
+                 * frees them (fixed ownership contract). */
+                gint rename_result = save_file_do_rename (
+                    ETFile, filename_cur_utf8, filename_new_utf8);
 
-                // if 'SF_HideMsgbox_Rename_File is TRUE', then errors are displayed only in log
-                if (!rc)
-                {
-                    if (!SF_HideMsgbox_Rename_File)
-                    {
-                        msgdialog = gtk_message_dialog_new (GTK_WINDOW (MainWindow),
-                                                            GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
-                                                            GTK_MESSAGE_ERROR,
-                                                            GTK_BUTTONS_CLOSE,
-                                                            _("Cannot rename file ‘%s’ to ‘%s’"),
-                                                            filename_cur_utf8,
-                                                            filename_new_utf8);
-                        gtk_message_dialog_format_secondary_text (GTK_MESSAGE_DIALOG (msgdialog),
-                                                                  "%s",
-                                                                  error->message);
-                        gtk_window_set_title (GTK_WINDOW (msgdialog),
-                                              _("Rename File Error"));
-
-                        gtk_dialog_run (GTK_DIALOG (msgdialog));
-                        gtk_widget_destroy (msgdialog);
-                    }
-
-                    Log_Print (LOG_ERROR,
-                               _("Cannot rename file ‘%s’ to ‘%s’: %s"),
-                               filename_cur_utf8, filename_new_utf8,
-                               error->message);
-
-                    et_application_window_status_bar_message (ET_APPLICATION_WINDOW (MainWindow),
-                                                              _("File(s) not renamed"),
-                                                              TRUE);
-                    g_error_free (error);
-                }
-
-                // if an error occurs when 'SF_HideMsgbox_Rename_File is TRUE', we don't stop saving...
-                if (!rc && !SF_HideMsgbox_Rename_File)
+                /* NOTE: on success the helper replaced
+                 * FileNameCur/FileNameNew->value_utf8, so the local
+                 * filename_*_utf8 pointers may dangle from here on.
+                 * They are not used again; the basenames were copied
+                 * before and are still valid. */
+                if (rename_result == -1)
                 {
                     stop_loop = -1;
-
                     g_free (basename_cur_utf8);
                     g_free (basename_new_utf8);
-
                     return stop_loop;
                 }
-
-                /* Mark after renaming files. */
-                ETFile->FileNameCur = ETFile->FileNameNew;
-                ET_Mark_File_Name_As_Saved (ETFile);
+                /* rename_result == 0: error in batch mode → keep saving
+                 * rename_result == 1: renamed                        */
                 break;
             }
             case GTK_RESPONSE_NO:
@@ -685,23 +748,17 @@ Save_File (ET_File *ETFile, gboolean multiple_files,
             case GTK_RESPONSE_CANCEL:
             case GTK_RESPONSE_DELETE_EVENT:
                 stop_loop = -1;
-
                 g_free (basename_cur_utf8);
                 g_free (basename_new_utf8);
-
                 return stop_loop;
-                break;
             default:
                 g_assert_not_reached ();
                 break;
         }
     }
 
-    g_free(basename_cur_utf8);
-    g_free(basename_new_utf8);
-
-    /* Refresh file into browser list */
-    // Browser_List_Refresh_File_In_List(ETFile);
+    g_free (basename_cur_utf8);
+    g_free (basename_new_utf8);
 
     return 1;
 }

@@ -24,6 +24,10 @@
 
 G_BEGIN_DECLS
 
+/* Response IDs for the rename conflict dialog */
+#define ET_RENAME_CONFLICT_AUTO   1
+#define ET_RENAME_CONFLICT_MANUAL 2
+
 /*
  * Combobox misc functions
  */
@@ -38,7 +42,11 @@ gchar * et_disc_number_to_string (const guint disc_number);
 gchar * et_track_number_to_string (const guint track_number);
 
 void et_filename_prepare (gchar *filename_utf8, gboolean replace_illegal);
-gboolean et_rename_file (const gchar *old_filename, const gchar *new_filename, GError **error);
+gboolean et_rename_file (const gchar *old_filepath,
+                         const gchar *new_filepath,
+                         gchar      **actual_new_path,
+                         GtkWindow   *parent,
+                         GError     **error);
 
 guint et_undo_key_new (void);
 gint et_normalized_strcmp0 (const gchar *str1, const gchar *str2);
