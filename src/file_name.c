@@ -131,31 +131,14 @@ gboolean
 et_file_name_detect_difference (const File_Name *a,
                                 const File_Name *b)
 {
-    const gchar *filename1_ck;
-    const gchar *filename2_ck;
-
-    g_return_val_if_fail (a && b, FALSE);
-
     if (a && !b) return TRUE;
     if (!a && b) return TRUE;
 
     /* Both a and b are != NULL. */
-    if (!a->value && !b->value) return FALSE;
-    if (a->value && !b->value) return TRUE;
-    if (!a->value && b->value) return TRUE;
+    if (!a->value_utf8 && !b->value_utf8) return FALSE;
+    if (a->value_utf8 && !b->value_utf8) return TRUE;
+    if (!a->value_utf8 && b->value_utf8) return TRUE;
 
-    /* Compare collate keys (with FileName->value converted to UTF-8 as it
-     * contains raw data). */
-    filename1_ck = a->value_ck;
-    filename2_ck = b->value_ck;
-
-    /* Filename changed ? (we check path + file). */
-    if (strcmp (filename1_ck, filename2_ck) != 0)
-    {
-        return TRUE;
-    }
-    else
-    {
-        return FALSE;
-    }
+    /* Compare exact UTF-8 strings instead of collation keys */
+    return strcmp (a->value_utf8, b->value_utf8) != 0;
 }

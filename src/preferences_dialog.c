@@ -105,6 +105,10 @@ typedef struct
     GtkWidget *rfs_spaces_radio;
     GtkWidget *rfs_remove_radio;
     GtkWidget *pfs_uppercase_prep_check;
+    GtkWidget *pfs_normalize_utf8_check;
+    GtkWidget *pfs_replace_char_check;
+    GtkWidget *pfs_replace_from_entry;
+    GtkWidget *pfs_replace_to_entry;
     GtkWidget *overwrite_fields_check;
     GtkWidget *default_comment_check;
     GtkWidget *default_comment_entry;
@@ -637,6 +641,30 @@ create_preferences_dialog (EtPreferencesDialog *self)
                      priv->pfs_uppercase_prep_check, "active",
                      G_SETTINGS_BIND_DEFAULT);
 
+    /* Bind UTF-8 Normalization */
+    g_settings_bind (MainSettings, "process-normalize-utf8",
+                     priv->pfs_normalize_utf8_check, "active",
+                     G_SETTINGS_BIND_DEFAULT);
+
+    /* Bind Character Replacement */
+    g_settings_bind (MainSettings, "process-replace-char-enable",
+                     priv->pfs_replace_char_check, "active",
+                     G_SETTINGS_BIND_DEFAULT);
+
+    g_settings_bind (MainSettings, "process-replace-char-enable",
+                     priv->pfs_replace_from_entry, "sensitive",
+                     G_SETTINGS_BIND_GET);
+    g_settings_bind (MainSettings, "process-replace-from",
+                     priv->pfs_replace_from_entry, "text",
+                     G_SETTINGS_BIND_DEFAULT);
+
+    g_settings_bind (MainSettings, "process-replace-char-enable",
+                     priv->pfs_replace_to_entry, "sensitive",
+                     G_SETTINGS_BIND_GET);
+    g_settings_bind (MainSettings, "process-replace-to",
+                     priv->pfs_replace_to_entry, "text",
+                     G_SETTINGS_BIND_DEFAULT);
+
     /* Other options */
     g_settings_bind (MainSettings, "fill-overwrite-tag-fields",
                      priv->overwrite_fields_check, "active",
@@ -1148,6 +1176,18 @@ et_preferences_dialog_class_init (EtPreferencesDialogClass *klass)
     gtk_widget_class_bind_template_child_private (widget_class,
                                                   EtPreferencesDialog,
                                                   pfs_uppercase_prep_check);
+    gtk_widget_class_bind_template_child_private (widget_class,
+                                                   EtPreferencesDialog,
+                                                   pfs_normalize_utf8_check);
+    gtk_widget_class_bind_template_child_private (widget_class,
+                                                   EtPreferencesDialog,
+                                                   pfs_replace_char_check);
+    gtk_widget_class_bind_template_child_private (widget_class,
+                                                   EtPreferencesDialog,
+                                                   pfs_replace_from_entry);
+    gtk_widget_class_bind_template_child_private (widget_class,
+                                                   EtPreferencesDialog,
+                                                   pfs_replace_to_entry);
     gtk_widget_class_bind_template_child_private (widget_class,
                                                   EtPreferencesDialog,
                                                   overwrite_fields_check);

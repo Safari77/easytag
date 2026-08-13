@@ -226,6 +226,408 @@ static void et_scan_on_response (GtkDialog *dialog, gint response_id,
  *************/
 
 /*
+ * Normalizes UTF-8 characters (NFKD) to decompose stylized characters (e.g. 𝐇𝐮𝐬𝐤 -> Husk)
+ */
+static void
+Scan_Process_UTF8_Normalize (gchar **string)
+{
+    gchar *normalized;
+
+    if (!string || !*string || **string == '\0')
+    {
+        return;
+    }
+
+    normalized = g_utf8_normalize (*string, -1, G_NORMALIZE_NFKD);
+    if (normalized != NULL)
+    {
+        g_free (*string);
+        *string = normalized;
+    }
+}
+
+#include <glib.h>
+#include <string.h>
+
+/* ========================================================================
+ * Minimal UAX #29 Grapheme Cluster Boundary Detection
+ * Covers: Regional Indicators, ZWJ sequences, skin-tone modifiers,
+ *         variation selectors, combining marks, Hangul syllables.
+ * This is NOT a full UAX #29 implementation but covers all emoji and
+ * common CJK/combining scenarios relevant to text replacement.
+ * ======================================================================== */
+
+typedef enum {
+    GCB_Other,
+    GCB_CR,
+    GCB_LF,
+    GCB_Control,
+    GCB_Extend,       /* Combining marks, ZWJ, variation selectors */
+    GCB_Regional_Indicator,
+    GCB_SpacingMark,
+    GCB_Prepend,
+    GCB_L,            /* Hangul Jamo */
+    GCB_V,
+    GCB_T,
+    GCB_LV,
+    GCB_LVT
+} GraphemeClusterBreak;
+
+/* Map a Unicode codepoint to its Grapheme_Cluster_Break property.
+ * This covers the ranges needed for emoji, combining marks, Hangul,
+ * regional indicators, and control characters. */
+static GraphemeClusterBreak
+get_grapheme_cluster_break (gunichar uc)
+{
+    /* Control characters (excluding CR, LF which are handled separately) */
+    if (uc == 0x000D) return GCB_CR;
+    if (uc == 0x000A) return GCB_LF;
+    if ((uc <= 0x001F) || (uc == 0x007F) ||
+        (uc >= 0x0080 && uc <= 0x009F) ||
+        (uc == 0x200C || uc == 0x200D)) /* ZWJ is Extend */
+    {
+        if (uc == 0x200C || uc == 0x200D) return GCB_Extend;
+        return GCB_Control;
+    }
+
+    /* Combining Diacritical Marks & general Extend category */
+    if ((uc >= 0x0300 && uc <= 0x036F) ||   /* Combining Diacriticals */
+        (uc >= 0x0483 && uc <= 0x0489) ||   /* Cyrillic combining */
+        (uc >= 0x0591 && uc <= 0x05BD) ||   /* Hebrew combining */
+        (uc == 0x05BF) ||
+        (uc >= 0x05C1 && uc <= 0x05C2) ||
+        (uc >= 0x05C4 && uc <= 0x05C5) ||
+        (uc == 0x05C7) ||
+        (uc >= 0x0610 && uc <= 0x061A) ||   /* Arabic combining */
+        (uc >= 0x064B && uc <= 0x065F) ||
+        (uc == 0x0670) ||
+        (uc >= 0x06D6 && uc <= 0x06DC) ||
+        (uc >= 0x06DF && uc <= 0x06E4) ||
+        (uc >= 0x06E7 && uc <= 0x06E8) ||
+        (uc >= 0x06EA && uc <= 0x06ED) ||
+        (uc >= 0x0711 && uc <= 0x0711) ||
+        (uc >= 0x0730 && uc <= 0x074A) ||
+        (uc >= 0x0900 && uc <= 0x0903) ||   /* Devanagari combining */
+        (uc >= 0x093A && uc <= 0x093C) ||
+        (uc >= 0x093E && uc <= 0x094F) ||
+        (uc >= 0x0951 && uc <= 0x0957) ||
+        (uc >= 0x0962 && uc <= 0x0963) ||
+        (uc >= 0xFE00 && uc <= 0xFE0F) ||   /* Variation Selectors */
+        (uc >= 0xFE20 && uc <= 0xFE2F) ||   /* Combining Half Marks */
+        (uc == 0x20E0 || uc == 0x20E1) ||
+        (uc >= 0x20D0 && uc <= 0x20FF) ||   /* Combining marks for symbols */
+        (uc >= 0x1AB0 && uc <= 0x1AFF) ||   /* Combining Diacriticals Extended */
+        (uc >= 0x1DC0 && uc <= 0x1DFF) ||   /* Combining Diacriticals Supplement */
+        (uc >= 0xE0100 && uc <= 0xE01EF) || /* Variation Selectors Supplement */
+        (uc >= 0x101FD && uc <= 0x101FD) || /* Phaistos Disc combining */
+        (uc >= 0x102E0 && uc <= 0x102E0))   /* Coptic combining */
+    {
+        return GCB_Extend;
+    }
+
+    /* Emoji modifiers (skin tones): U+1F3FB..U+1F3FF */
+    if (uc >= 0x1F3FB && uc <= 0x1F3FF)
+        return GCB_Extend;
+
+    /* Zero Width Joiner */
+    if (uc == 0x200D)
+        return GCB_Extend;
+
+    /* Regional Indicators: U+1F1E6..U+1F1FF */
+    if (uc >= 0x1F1E6 && uc <= 0x1F1FF)
+        return GCB_Regional_Indicator;
+
+    /* Hangul Jamo L, V, T and precomposed syllables */
+    if (uc >= 0x1100 && uc <= 0x115F) return GCB_L;
+    if (uc >= 0xA960 && uc <= 0xA97C) return GCB_L;
+    if (uc >= 0x1160 && uc <= 0x11A7) return GCB_V;
+    if (uc >= 0xD7B0 && uc <= 0xD7C6) return GCB_V;
+    if (uc >= 0x11A8 && uc <= 0x11FF) return GCB_T;
+    if (uc >= 0xD7CB && uc <= 0xD7FB) return GCB_T;
+    if (uc >= 0xAC00 && uc <= 0xD7A3)
+    {
+        /* LV or LVT: syllable - 0xAC00; if divisible by 28 → LV, else LVT */
+        if (((uc - 0xAC00) % 28) == 0) return GCB_LV;
+        return GCB_LVT;
+    }
+
+    return GCB_Other;
+}
+
+/* Returns pointer to the byte after the next grapheme cluster boundary.
+ * Follows UAX #29 rules for the categories we support above. */
+static const gchar *
+next_grapheme_cluster (const gchar *str, const gchar *end)
+{
+    const gchar *p;
+    gunichar uc;
+    GraphemeClusterBreak prev_gcb;
+    GraphemeClusterBreak cur_gcb;
+    gboolean odd_regional_indicator = FALSE;
+
+    if (!str || str >= end || *str == '\0')
+        return str;
+
+    uc = g_utf8_get_char_validated (str, end - str);
+    if (uc == (gunichar)-1 || uc == (gunichar)-2)
+        return str; /* Invalid; treat as single byte to avoid hang */
+
+    prev_gcb = get_grapheme_cluster_break (uc);
+    if (prev_gcb == GCB_Regional_Indicator)
+        odd_regional_indicator = TRUE;
+
+    p = g_utf8_next_char (str);
+
+    while (p < end && *p != '\0')
+    {
+        uc = g_utf8_get_char_validated (p, end - p);
+        if (uc == (gunichar)-1 || uc == (gunichar)-2)
+            break; /* Stop at invalid UTF-8 */
+
+        cur_gcb = get_grapheme_cluster_break (uc);
+
+        /* GB3: CR × LF */
+        if (prev_gcb == GCB_CR && cur_gcb == GCB_LF)
+        {
+            p = g_utf8_next_char (p);
+            prev_gcb = cur_gcb;
+            continue;
+        }
+
+        /* GB4: (Control | CR | LF) ÷ */
+        if (prev_gcb == GCB_Control || prev_gcb == GCB_CR || prev_gcb == GCB_LF)
+            break;
+
+        /* GB5: ÷ (Control | CR | LF) */
+        if (cur_gcb == GCB_Control || cur_gcb == GCB_CR || cur_gcb == GCB_LF)
+            break;
+
+        /* GB6: L × (L | V | LV | LVT) */
+        if (prev_gcb == GCB_L &&
+            (cur_gcb == GCB_L || cur_gcb == GCB_V ||
+             cur_gcb == GCB_LV || cur_gcb == GCB_LVT))
+        {
+            p = g_utf8_next_char (p);
+            prev_gcb = cur_gcb;
+            continue;
+        }
+
+        /* GB7: (LV | V) × (V | T) */
+        if ((prev_gcb == GCB_LV || prev_gcb == GCB_V) &&
+            (cur_gcb == GCB_V || cur_gcb == GCB_T))
+        {
+            p = g_utf8_next_char (p);
+            prev_gcb = cur_gcb;
+            continue;
+        }
+
+        /* GB8: (LVT | T) × T */
+        if ((prev_gcb == GCB_LVT || prev_gcb == GCB_T) && cur_gcb == GCB_T)
+        {
+            p = g_utf8_next_char (p);
+            prev_gcb = cur_gcb;
+            continue;
+        }
+
+        /* GB9: × (Extend | ZWJ) */
+        if (cur_gcb == GCB_Extend)
+        {
+            p = g_utf8_next_char (p);
+            prev_gcb = cur_gcb;
+            continue;
+        }
+
+        /* GB9b: Prepend × anything (we don't track Prepend above, skip) */
+
+        /* GB11: \p{Extended_Pictographic} Extend* ZWJ × \p{Extended_Pictographic}
+         * Simplified: after ZWJ (which is Extend), if current is Extended_Pictographic,
+         * do NOT break. We approximate Extended_Pictographic as any non-Other
+         * codepoint in emoji ranges. For safety, we just continue past ZWJ+emoji. */
+        if (prev_gcb == GCB_Extend)
+        {
+            /* Check if previous was ZWJ specifically and current looks like emoji */
+            const gchar *prev_p = g_utf8_prev_char (p);
+            gunichar prev_uc = g_utf8_get_char (prev_p);
+            if (prev_uc == 0x200D && uc >= 0x1F000)
+            {
+                p = g_utf8_next_char (p);
+                prev_gcb = cur_gcb;
+                continue;
+            }
+        }
+
+        /* GB12/GB13: Regional_Indicator × Regional_Indicator (only pairs) */
+        if (prev_gcb == GCB_Regional_Indicator && cur_gcb == GCB_Regional_Indicator)
+        {
+            if (odd_regional_indicator)
+            {
+                /* Second RI in a pair: consume and break after */
+                p = g_utf8_next_char (p);
+                odd_regional_indicator = FALSE;
+                break;
+            }
+            else
+            {
+                odd_regional_indicator = TRUE;
+                p = g_utf8_next_char (p);
+                prev_gcb = cur_gcb;
+                continue;
+            }
+        }
+
+        /* GB999: ÷ Any — default break */
+        break;
+    }
+
+    return p;
+}
+
+/* Count grapheme clusters in a validated UTF-8 string */
+static gsize
+count_grapheme_clusters (const gchar *str)
+{
+    gsize count = 0;
+    const gchar *p = str;
+    const gchar *end = str + strlen (str);
+
+    while (p < end && *p != '\0')
+    {
+        const gchar *next = next_grapheme_cluster (p, end);
+        if (next == p)
+            break; /* Safety: prevent infinite loop on malformed data */
+        count++;
+        p = next;
+    }
+
+    return count;
+}
+
+/* ========================================================================
+ * Public replacement function
+ * ======================================================================== */
+static void
+Scan_Convert_Exact_UTF8_Chars (gchar **string, const gchar *from, const gchar *to)
+{
+    gsize count_from, count_to;
+    const gchar *p_from, *p_to;
+    const gchar *end_from, *end_to;
+    GString *result;
+    const gchar *cursor, *end_str;
+
+    if (!string || !*string || !from || !to)
+        return;
+
+    /* Reject invalid UTF-8 in all inputs */
+    if (!g_utf8_validate (from, -1, NULL))
+    {
+        Log_Print (LOG_ERROR,
+                   _("Character replacement failed: 'from' argument is not valid UTF-8"));
+        return;
+    }
+
+    if (!g_utf8_validate (to, -1, NULL))
+    {
+        Log_Print (LOG_ERROR,
+                   _("Character replacement failed: 'to' argument is not valid UTF-8"));
+        return;
+    }
+
+    if (!g_utf8_validate (*string, -1, NULL))
+    {
+        Log_Print (LOG_ERROR,
+                   _("Character replacement failed: target string is not valid UTF-8"));
+        return;
+    }
+
+    count_from = count_grapheme_clusters (from);
+    count_to   = count_grapheme_clusters (to);
+
+    if (count_from == 0)
+    {
+        Log_Print (LOG_ERROR,
+                   _("Character replacement failed: 'from' contains zero grapheme clusters"));
+        return;
+    }
+
+    if (count_from != count_to)
+    {
+        Log_Print (LOG_ERROR,
+                   _("Character replacement failed: 'from' (%" G_GSIZE_FORMAT
+                     " graphemes) and 'to' (%" G_GSIZE_FORMAT
+                     " graphemes) must have exact equal length"),
+                   count_from, count_to);
+        return;
+    }
+
+    /* Pre-compute grapheme cluster boundaries in 'from' and 'to' so we
+     * don't re-scan them for every position in the input string. */
+    {
+        const gchar **from_bounds = g_new (const gchar *, count_from + 1);
+        const gchar **to_bounds   = g_new (const gchar *, count_to + 1);
+        gsize i;
+
+        end_from = from + strlen (from);
+        p_from = from;
+        for (i = 0; i <= count_from; i++)
+        {
+            from_bounds[i] = p_from;
+            if (i < count_from)
+                p_from = next_grapheme_cluster (p_from, end_from);
+        }
+
+        end_to = to + strlen (to);
+        p_to = to;
+        for (i = 0; i <= count_to; i++)
+        {
+            to_bounds[i] = p_to;
+            if (i < count_to)
+                p_to = next_grapheme_cluster (p_to, end_to);
+        }
+
+        /* Single-pass scan of the input string */
+        result = g_string_sized_new (strlen (*string));
+        end_str = *string + strlen (*string);
+        cursor = *string;
+
+        while (cursor < end_str && *cursor != '\0')
+        {
+            const gchar *next_cursor = next_grapheme_cluster (cursor, end_str);
+            gboolean matched = FALSE;
+
+            if (next_cursor == cursor)
+                break;
+
+            /* Try to match this grapheme cluster against each entry in 'from' */
+            for (i = 0; i < count_from; i++)
+            {
+                gsize g_from_len = (gsize)(from_bounds[i + 1] - from_bounds[i]);
+                gsize g_cursor_len = (gsize)(next_cursor - cursor);
+
+                if (g_from_len == g_cursor_len &&
+                    memcmp (cursor, from_bounds[i], g_from_len) == 0)
+                {
+                    gsize g_to_len = (gsize)(to_bounds[i + 1] - to_bounds[i]);
+                    g_string_append_len (result, to_bounds[i], g_to_len);
+                    matched = TRUE;
+                    break;
+                }
+            }
+
+            if (!matched)
+                g_string_append_len (result, cursor, next_cursor - cursor);
+
+            cursor = next_cursor;
+        }
+
+        g_free (from_bounds);
+        g_free (to_bounds);
+    }
+
+    g_free (*string);
+    *string = g_string_free (result, FALSE);
+}
+
+/*
  * Return the field of a 'File_Tag' structure corresponding to the mask code
  */
 static gchar **
@@ -956,6 +1358,24 @@ et_scan_generate_new_filename_from_mask (const ET_File *ETFile,
             mask_item->type = FIELD;
             mask_item->string = g_strdup(*source);
 
+            /* Normalize UTF-8 characters if enabled */
+            if (g_settings_get_boolean (MainSettings, "process-normalize-utf8"))
+            {
+                Scan_Process_UTF8_Normalize (&mask_item->string);
+            }
+
+            /* Replace characters if enabled */
+            if (g_settings_get_boolean (MainSettings, "process-replace-char-enable"))
+            {
+                gchar *from = g_settings_get_string (MainSettings, "process-replace-from");
+                gchar *to   = g_settings_get_string (MainSettings, "process-replace-to");
+
+                Scan_Convert_Exact_UTF8_Chars (&mask_item->string, from, to);
+
+                g_free (from);
+                g_free (to);
+            }
+
             // Replace invalid characters for this field
             /* Do not replace characters in a playlist information field. */
             if (!no_dir_check_or_conversion)
@@ -1195,10 +1615,11 @@ et_scan_generate_new_directory_name_from_mask (const ET_File *ETFile,
                                                     no_dir_check_or_conversion);
 }
 
-
 /*
- * Replace something with something else ;)
- * Here use Regular Expression, to search and replace.
+ * Replace literal characters/grapheme clusters in a tag or filename.
+ * Uses exact grapheme-cluster matching — NOT regex.
+ * 'from' and 'to' must contain the same number of grapheme clusters;
+ * each grapheme in 'from' is replaced by the corresponding grapheme in 'to'.
  */
 static void
 Scan_Convert_Character (EtScanDialog *self, gchar **string)
@@ -1206,47 +1627,19 @@ Scan_Convert_Character (EtScanDialog *self, gchar **string)
     EtScanDialogPrivate *priv;
     gchar *from;
     gchar *to;
-    GRegex *regex;
-    GError *regex_error = NULL;
-    gchar *new_string;
 
     priv = et_scan_dialog_get_instance_private (self);
 
-    from = gtk_editable_get_chars (GTK_EDITABLE (priv->convert_from_entry), 0,
-                                 -1);
-    to = gtk_editable_get_chars (GTK_EDITABLE (priv->convert_to_entry), 0, -1);
+    from = gtk_editable_get_chars (GTK_EDITABLE (priv->convert_from_entry), 0, -1);
+    to   = gtk_editable_get_chars (GTK_EDITABLE (priv->convert_to_entry), 0, -1);
 
-    regex = g_regex_new (from, 0, 0, &regex_error);
-    if (regex_error != NULL)
-    {
-        goto handle_error;
-    }
+    /* Delegate to the shared grapheme-aware literal replacer.
+     * All UTF-8 validation, grapheme counting, error logging,
+     * and single-pass replacement are handled there. */
+    Scan_Convert_Exact_UTF8_Chars (string, from, to);
 
-    new_string = g_regex_replace (regex, *string, -1, 0, to, 0, &regex_error);
-    if (regex_error != NULL)
-    {
-        g_free (new_string);
-        g_regex_unref (regex);
-        goto handle_error;
-    }
-
-    /* Success. */
-    g_regex_unref (regex);
-    g_free (*string);
-    *string = new_string;
-
-out:
     g_free (from);
     g_free (to);
-    return;
-
-handle_error:
-    Log_Print (LOG_ERROR, _("Error while processing fields ‘%s’"),
-               regex_error->message);
-
-    g_error_free (regex_error);
-
-    goto out;
 }
 
 static void
@@ -1255,7 +1648,28 @@ Scan_Process_Fields_Functions (EtScanDialog *self,
 {
     const EtProcessFieldsConvert process = g_settings_get_enum (MainSettings,
                                                                 "process-convert");
+    const EtProcessCapitalize capitalize = g_settings_get_enum (MainSettings,
+                                                                "process-capitalize");
 
+    /* 1. UTF-8 Normalization (NFKD) */
+    if (g_settings_get_boolean (MainSettings, "process-normalize-utf8"))
+    {
+        Scan_Process_UTF8_Normalize (string);
+    }
+
+    /* 2. Exact UTF-8 Character Replacement */
+    if (g_settings_get_boolean (MainSettings, "process-replace-char-enable"))
+    {
+        gchar *from = g_settings_get_string (MainSettings, "process-replace-from");
+        gchar *to   = g_settings_get_string (MainSettings, "process-replace-to");
+
+        Scan_Convert_Exact_UTF8_Chars (string, from, to);
+
+        g_free (from);
+        g_free (to);
+    }
+
+    /* Character conversions (spaces, underscores, etc.) */
     switch (process)
     {
         case ET_PROCESS_FIELDS_CONVERT_SPACES:
@@ -1277,64 +1691,59 @@ Scan_Process_Fields_Functions (EtScanDialog *self,
 
     if (g_settings_get_boolean (MainSettings, "process-insert-capital-spaces"))
     {
-        gchar *res;
-        res = Scan_Process_Fields_Insert_Space (*string);
+        gchar *res = Scan_Process_Fields_Insert_Space (*string);
         g_free (*string);
         *string = res;
     }
 
-    if (g_settings_get_boolean (MainSettings,
-        "process-remove-duplicate-spaces"))
+    if (g_settings_get_boolean (MainSettings, "process-remove-duplicate-spaces"))
     {
         Scan_Process_Fields_Keep_One_Space (*string);
     }
 
-    if (g_settings_get_boolean (MainSettings, "process-uppercase-all"))
+    /* Capitalization Logic mapped to EtProcessCapitalize Enum */
+    switch (capitalize)
     {
-        gchar *res;
-        res = Scan_Process_Fields_All_Uppercase (*string);
-        g_free (*string);
-        *string = res;
-    }
-
-    if (g_settings_get_boolean (MainSettings, "process-lowercase-all"))
-    {
-        gchar *res;
-        res = Scan_Process_Fields_All_Downcase (*string);
-        g_free (*string);
-        *string = res;
-    }
-
-    if (g_settings_get_boolean (MainSettings,
-                                "process-uppercase-first-letter"))
-    {
-        gchar *res;
-        res = Scan_Process_Fields_Letter_Uppercase (*string);
-        g_free (*string);
-        *string = res;
-    }
-
-    if (g_settings_get_boolean (MainSettings,
-                                "process-uppercase-first-letters"))
-    {
-        gboolean uppercase_preps;
-        gboolean handle_roman;
-
-        uppercase_preps = g_settings_get_boolean (MainSettings,
-                                                  "process-uppercase-prepositions");
-        handle_roman = g_settings_get_boolean (MainSettings,
-                                               "process-detect-roman-numerals");
-        Scan_Process_Fields_First_Letters_Uppercase (string, uppercase_preps,
-                                                     handle_roman);
+        case ET_PROCESS_CAPITALIZE_ALL_UP:
+            {
+                gchar *res = Scan_Process_Fields_All_Uppercase (*string);
+                g_free (*string);
+                *string = res;
+            }
+            break;
+        case ET_PROCESS_CAPITALIZE_ALL_DOWN:
+            {
+                gchar *res = Scan_Process_Fields_All_Downcase (*string);
+                g_free (*string);
+                *string = res;
+            }
+            break;
+        case ET_PROCESS_CAPITALIZE_FIRST_LETTER_UP:
+            {
+                gchar *res = Scan_Process_Fields_Letter_Uppercase (*string);
+                g_free (*string);
+                *string = res;
+            }
+            break;
+        case ET_PROCESS_CAPITALIZE_FIRST_WORDS_UP:
+            {
+                gboolean uppercase_preps = g_settings_get_boolean (MainSettings,
+                                                                  "process-uppercase-prepositions");
+                gboolean handle_roman    = g_settings_get_boolean (MainSettings,
+                                                                  "process-detect-roman-numerals");
+                Scan_Process_Fields_First_Letters_Uppercase (string, uppercase_preps, handle_roman);
+            }
+            break;
+        case ET_PROCESS_CAPITALIZE_NO_CHANGE:
+        default:
+            break;
     }
 
     if (g_settings_get_boolean (MainSettings, "process-remove-spaces"))
     {
         Scan_Process_Fields_Remove_Space (*string);
     }
-
 }
-
 
 /*****************************
  * Scanner To Process Fields *

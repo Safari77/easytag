@@ -446,6 +446,28 @@
       <default>true</default>
     </key>
 
+    <key name="process-normalize-utf8" type="b">
+      <default>false</default>
+      <summary>Normalize UTF-8 characters</summary>
+      <description>Whether to normalize stylized UTF-8 characters into standard ASCII/Unicode letters when processing fields.</description>
+    </key>
+
+    <key name="process-replace-char-enable" type="b">
+      <default>false</default>
+      <summary>Replace specified character</summary>
+      <description>Whether to replace arbitrary characters when processing fields.</description>
+    </key>
+
+    <key name="process-replace-from" type="s">
+      <default>"'"</default>
+      <summary>Character to replace</summary>
+    </key>
+
+    <key name="process-replace-to" type="s">
+      <default>"’"</default>
+      <summary>Replacement character</summary>
+    </key>
+
     <key name="playlist-filename-mask" type="s">
       <summary>Playlist filename mask</summary>
       <description>The default filename mask to use for a new playlist</description>

@@ -999,6 +999,47 @@
                                     </object>
                                 </child>
                                 <child>
+                                    <object class="GtkCheckButton" id="pfs_normalize_utf8_check">
+                                        <property name="label" translatable="yes">Normalize UTF-8 characters</property>
+                                        <property name="margin-left">24</property>
+                                        <property name="tooltip-text" translatable="yes">Convert stylized mathematical or compatibility Unicode characters back to plain text</property>
+                                        <property name="visible">True</property>
+                                    </object>
+                                </child>
+                                <child>
+                                    <object class="GtkBox" id="pfs_replace_char_box">
+                                        <property name="margin-left">24</property>
+                                        <property name="spacing">6</property>
+                                        <property name="visible">True</property>
+                                        <child>
+                                            <object class="GtkCheckButton" id="pfs_replace_char_check">
+                                                <property name="label" translatable="yes">Replace character:</property>
+                                                <property name="visible">True</property>
+                                            </object>
+                                        </child>
+                                        <child>
+                                            <object class="GtkEntry" id="pfs_replace_from_entry">
+                                                <property name="width-chars">4</property>
+                                                <property name="max-width-chars">4</property>
+                                                <property name="visible">True</property>
+                                            </object>
+                                        </child>
+                                        <child>
+                                            <object class="GtkLabel" id="pfs_replace_with_label">
+                                                <property name="label" translatable="yes">with:</property>
+                                                <property name="visible">True</property>
+                                            </object>
+                                        </child>
+                                        <child>
+                                            <object class="GtkEntry" id="pfs_replace_to_entry">
+                                                <property name="width-chars">4</property>
+                                                <property name="max-width-chars">4</property>
+                                                <property name="visible">True</property>
+                                            </object>
+                                        </child>
+                                    </object>
+                                </child>
+                                <child>
                                     <object class="GtkLabel" id="fields_label">
                                         <property name="halign">start</property>
                                         <property name="label" translatable="yes">Fields</property>
